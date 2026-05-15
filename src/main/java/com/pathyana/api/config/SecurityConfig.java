@@ -2,31 +2,77 @@ package com.pathyana.api.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.List;
 
 /**
- * Spring Security configuration.
+ * Spring Security configuration — Phase 3.
  *
- * PHASE 1: completely open — no auth on any endpoint. We need to verify Groq works
- * end-to-end before we layer JWT on top. Adding auth now would just give us two
- * failure modes to debug instead of one.
+ * Stateless API:
+ *   - No HTTP sessions. Every request carries its own JWT.
+ *   - No CSRF tokens needed (CSRF protection is for cookie-based sessions).
  *
- * PHASE 4 (later): we replace this with JWT-based auth. Public endpoints (signup,
- * login, healthcheck) will be permitAll; everything else requires a valid token.
+ * Authorization rules (top to bottom, first match wins):
+ *   1. /api/auth/**        — public (signup, login, verify email)
+ *   2. /api/test/**        — public (Phase 1 sanity-check endpoints; remove later)
+ *   3. GET /api/health     — public (for uptime monitors)
+ *   4. Everything else     — requires a valid JWT
  *
- * Do not deploy this configuration anywhere users can reach. Local dev only.
+ * CORS:
+ *   Permissive for local dev — React dev server runs on http://localhost:3000 or :5173.
+ *   Lock this down to specific origins before deployment.
  */
 @Configuration
 public class SecurityConfig {
 
+    private final JwtFilter jwtFilter;
+
+    public SecurityConfig(JwtFilter jwtFilter) {
+        this.jwtFilter = jwtFilter;
+    }
+
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
-            .csrf(csrf -> csrf.disable())               // we use stateless REST, no CSRF tokens
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
-                .anyRequest().permitAll()
-            );
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers("/api/test/**").permitAll()
+                .requestMatchers(HttpMethod.GET, "/api/health").permitAll()
+                .anyRequest().authenticated()
+            )
+            // Add JWT filter BEFORE the default username/password filter — that way
+            // an authenticated request never falls into Spring's basic-auth flow.
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+
         return http.build();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        // Allow the React dev server origins. Add your deployed frontend URL later.
+        config.setAllowedOrigins(List.of(
+            "http://localhost:3000",
+            "http://localhost:5173"
+        ));
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        config.setMaxAge(3600L);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
     }
 }
