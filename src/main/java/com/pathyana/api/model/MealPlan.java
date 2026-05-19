@@ -2,29 +2,24 @@ package com.pathyana.api.model;
 
 import jakarta.persistence.*;
 import lombok.Data;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 
 /**
- * Output of one MealOrchestratorService run.
+ * One generated meal. Used both for one-off generations (weeklyPlanId = null)
+ * and for individual meals inside a weekly plan (weeklyPlanId set, slot + day populated).
  *
- * The orchestrator's pipeline produces three distinct artifacts that we want to query
- * and display independently:
- *
- *   recipeJson       — the Chef's approved output (recipe, ingredients, steps, nutrition)
- *   reviewJson       — the Reviewer's verdict + deterministic safety findings
- *   groceryListJson  — the Optimizer's output AFTER the deterministic Swapper has run
- *
- * status tracks the pipeline outcome:
- *   DRAFT          — generation in progress (rare, for async support later)
- *   APPROVED       — Reviewer passed, ready to use
- *   FAILED_SAFETY  — couldn't generate a safe recipe after retries
- *   FAILED_SYSTEM  — LLM/parsing/network error
- *
- * regenerationCount tells us how many Chef retries were needed before the Reviewer passed.
- * Useful for monitoring — if this is consistently 2+, our prompts need tuning.
+ * Why we extended this rather than create a parallel entity:
+ *   - Same shape of data (recipe, review, grocery)
+ *   - Single source of truth for "all meals this user has had generated"
+ *   - Lets one-off and weekly meals show up in a unified history
  */
 @Entity
-@Table(name = "meal_plans", indexes = @Index(columnList = "user_id,created_at"))
+@Table(name = "meal_plans",
+       indexes = {
+           @Index(columnList = "user_id,created_at"),
+           @Index(columnList = "weekly_plan_id,day_number")
+       })
 @Data
 public class MealPlan {
 
@@ -52,6 +47,24 @@ public class MealPlan {
 
     @Column(name = "regeneration_count")
     private Integer regenerationCount = 0;
+
+    // ---------- weekly plan linkage (nullable for one-off meals) ----------
+
+    /** FK to weekly_meal_plans.id. Null for one-off meals. */
+    @Column(name = "weekly_plan_id")
+    private Long weeklyPlanId;
+
+    /** Day of the week within the plan (1-7). Null for one-off meals. */
+    @Column(name = "day_number")
+    private Integer dayNumber;
+
+    /** "brunch", "dinner", "snack". Null for one-off meals. */
+    @Column(name = "meal_slot")
+    private String mealSlot;
+
+    /** Actual calendar date this meal is planned for. Null for one-off. */
+    @Column(name = "planned_date")
+    private LocalDate plannedDate;
 
     @Column(name = "created_at", updatable = false)
     private LocalDateTime createdAt = LocalDateTime.now();

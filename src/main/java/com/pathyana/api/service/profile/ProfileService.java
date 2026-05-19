@@ -4,27 +4,34 @@ import com.pathyana.api.dto.ProfileSeedRequest;
 import com.pathyana.api.dto.ProfileSeedRequest.MedicationSeed;
 import com.pathyana.api.model.*;
 import com.pathyana.api.repository.UserRepository;
+import com.pathyana.api.service.RxNormService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Optional;
 
 /**
- * Service for managing user profile data.
+ * Profile management.
  *
- * For Phase 4, just one operation: replace a user's profile from a seed request.
- * Used by the dev "/api/profile/seed" endpoint to quickly populate test users.
+ * v2 — uses RxNormService to normalize medication brand names to generic names
+ * before saving. Improves rule-engine hit rate when users type brand names.
  *
- * Phase 5 (later) will add granular endpoints: add allergy, remove medication, etc.
+ * If RxNorm can't resolve a name, we fall back to the lowercased displayName.
+ * The user doesn't see a failure; the UI shows an "advisory only" badge.
  */
 @Service
 public class ProfileService {
 
-    private final UserRepository userRepository;
+    private static final Logger log = LoggerFactory.getLogger(ProfileService.class);
 
-    public ProfileService(UserRepository userRepository) {
+    private final UserRepository userRepository;
+    private final RxNormService rxNormService;
+
+    public ProfileService(UserRepository userRepository, RxNormService rxNormService) {
         this.userRepository = userRepository;
+        this.rxNormService = rxNormService;
     }
 
     @Transactional
@@ -40,14 +47,11 @@ public class ProfileService {
         if (req.windowProtocol() != null) {
             try {
                 user.setWindowProtocol(User.WindowProtocol.valueOf(req.windowProtocol().toUpperCase()));
-            } catch (IllegalArgumentException e) {
-                // ignore invalid enum — leaves existing value
-            }
+            } catch (IllegalArgumentException ignored) {}
         }
         if (req.mealToBedBufferMinutes() != null) user.setMealToBedBufferMinutes(req.mealToBedBufferMinutes());
         if (req.typicalBedtime() != null) user.setTypicalBedtime(req.typicalBedtime());
 
-        // Replace collections wholesale. orphanRemoval=true on the entity deletes the old rows.
         if (req.healthConditions() != null) {
             user.getHealthConditions().clear();
             for (String c : req.healthConditions()) {
@@ -90,7 +94,7 @@ public class ProfileService {
                 Medication med = new Medication();
                 med.setUser(user);
                 med.setDisplayName(m.displayName());
-                med.setGenericName(m.genericName() == null ? "" : m.genericName().toLowerCase().trim());
+                med.setGenericName(resolveGenericName(m));
                 med.setDosage(m.dosage());
                 med.setActive(true);
                 user.getMedications().add(med);
@@ -99,5 +103,20 @@ public class ProfileService {
 
         user.setProfileCompleted(true);
         return userRepository.save(user);
+    }
+
+    private String resolveGenericName(MedicationSeed seed) {
+        if (seed.genericName() != null && !seed.genericName().isBlank()) {
+            return seed.genericName().toLowerCase().trim();
+        }
+        if (seed.displayName() == null) return "";
+
+        Optional<String> resolved = rxNormService.resolveToGeneric(seed.displayName());
+        if (resolved.isPresent()) {
+            log.info("RxNorm normalized '{}' -> '{}'", seed.displayName(), resolved.get());
+            return resolved.get();
+        }
+        log.info("RxNorm could not resolve '{}', using lowercased fallback", seed.displayName());
+        return seed.displayName().toLowerCase().trim();
     }
 }

@@ -7,8 +7,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.pathyana.api.llm.GroqClient;
 import com.pathyana.api.model.*;
 import com.pathyana.api.repository.MealPlanRepository;
+import com.pathyana.api.service.safety.ConditionFoodRuleEngine;
 import com.pathyana.api.service.safety.DrugNutrientRuleEngine;
-import com.pathyana.api.service.safety.DrugNutrientRuleEngine.Finding;
 import com.pathyana.api.service.safety.DrugNutrientRuleEngine.Severity;
 import com.pathyana.api.service.safety.IngredientSwapper;
 import com.pathyana.api.service.safety.IngredientSwapper.Swap;
@@ -21,19 +21,13 @@ import java.time.LocalTime;
 import java.util.*;
 
 /**
- * The Chef → Reviewer (+ deterministic safety) → Optimizer (+ swapper) pipeline.
+ * The 3-agent pipeline with TWO deterministic rule engines (drug + condition).
  *
- * Control flow:
- *   1. CHEF generates a recipe.
- *   2. DETERMINISTIC RULE ENGINE checks ingredients vs user's medications.
- *      - Any BLOCK finding → regenerate with explicit feedback, WITHOUT calling the Reviewer
- *        (saves a Groq call; the rule engine is authoritative).
- *   3. REVIEWER LLM does the nuanced review.
- *   4. If Reviewer says FAIL → regenerate with its guidance.
- *   5. After MAX_REGENERATIONS attempts, give up and return FAILED_SAFETY with the last attempt.
- *   6. OPTIMIZER converts the approved recipe to a grocery list.
- *   7. SWAPPER deterministically replaces items based on user profile.
- *   8. Persist and return.
+ * v2 changes:
+ *   - Adds ConditionFoodRuleEngine alongside DrugNutrientRuleEngine.
+ *   - Surfaces uncovered medications and conditions in the response so the UI can
+ *     flag them as "not in our safety database".
+ *   - Either engine can trigger regeneration.
  */
 @Service
 public class MealOrchestratorService {
@@ -44,17 +38,20 @@ public class MealOrchestratorService {
         "Pathyana provides educational information only. Not a substitute for advice from a qualified healthcare professional.";
 
     private final GroqClient groqClient;
-    private final DrugNutrientRuleEngine ruleEngine;
+    private final DrugNutrientRuleEngine drugEngine;
+    private final ConditionFoodRuleEngine conditionEngine;
     private final IngredientSwapper swapper;
     private final MealPlanRepository mealPlanRepository;
     private final ObjectMapper mapper = new ObjectMapper();
 
     public MealOrchestratorService(GroqClient groqClient,
-                                   DrugNutrientRuleEngine ruleEngine,
+                                   DrugNutrientRuleEngine drugEngine,
+                                   ConditionFoodRuleEngine conditionEngine,
                                    IngredientSwapper swapper,
                                    MealPlanRepository mealPlanRepository) {
         this.groqClient = groqClient;
-        this.ruleEngine = ruleEngine;
+        this.drugEngine = drugEngine;
+        this.conditionEngine = conditionEngine;
         this.swapper = swapper;
         this.mealPlanRepository = mealPlanRepository;
     }
@@ -62,11 +59,16 @@ public class MealOrchestratorService {
     public MealPlan generate(User user, String userRequest) {
         Objects.requireNonNull(user, "user");
         String profileJson = buildProfileContext(user);
-        List<String> medGenericNames = extractMedications(user);
+        List<String> medGenericNames = extractMedicationGenericNames(user);
+        List<String> conditions = extractConditions(user);
+
+        List<String> uncoveredMeds = extractUncoveredMedications(user);
+        List<String> uncoveredConditions = extractUncoveredConditions(user);
 
         JsonNode lastRecipe = null;
         ObjectNode lastReview = null;
-        List<Finding> deterministicFindings = List.of();
+        List<DrugNutrientRuleEngine.Finding> drugFindings = List.of();
+        List<ConditionFoodRuleEngine.Finding> conditionFindings = List.of();
         String regenerationFeedback = "";
         int attempts = 0;
         boolean approved = false;
@@ -75,20 +77,22 @@ public class MealOrchestratorService {
             attempts++;
             log.info("Pipeline attempt {} for user {}", attempts, user.getId());
 
-            // 1. Chef
             JsonNode recipe = callChef(profileJson, userRequest, regenerationFeedback);
             lastRecipe = recipe;
             List<String> ingredientNames = extractIngredientNames(recipe);
 
-            // 2. Deterministic rule engine — authoritative
-            deterministicFindings = ruleEngine.check(medGenericNames, ingredientNames);
-            if (ruleEngine.hasBlocker(deterministicFindings)) {
-                regenerationFeedback = buildFeedbackFromFindings(deterministicFindings);
-                log.info("Deterministic engine blocked attempt {}: {}", attempts, regenerationFeedback);
-                continue;  // skip Reviewer, go straight to Chef retry
+            drugFindings = drugEngine.check(medGenericNames, ingredientNames);
+            conditionFindings = conditionEngine.check(conditions, ingredientNames);
+
+            boolean drugBlocked = drugEngine.hasBlocker(drugFindings);
+            boolean conditionBlocked = conditionEngine.hasBlocker(conditionFindings);
+
+            if (drugBlocked || conditionBlocked) {
+                regenerationFeedback = buildFeedback(drugFindings, conditionFindings);
+                log.info("Deterministic engines blocked attempt {}:\n{}", attempts, regenerationFeedback);
+                continue;
             }
 
-            // 3. Reviewer LLM
             ObjectNode review = callReviewer(profileJson, recipe);
             lastReview = review;
             String verdict = review.path("verdict").asText("FAIL");
@@ -105,10 +109,10 @@ public class MealOrchestratorService {
         plan.setUserId(user.getId());
         plan.setRegenerationCount(attempts - 1);
         plan.setRecipeJson(lastRecipe == null ? null : lastRecipe.toString());
-        plan.setReviewJson(buildReviewPayload(lastReview, deterministicFindings).toString());
+        plan.setReviewJson(buildReviewPayload(lastReview, drugFindings, conditionFindings,
+            uncoveredMeds, uncoveredConditions).toString());
 
         if (approved) {
-            // 4 & 5. Optimizer + Swapper
             JsonNode groceryList = callOptimizer(lastRecipe);
             List<Swap> swaps = applySwapsToGrocery(groceryList, user);
 
@@ -134,7 +138,7 @@ public class MealOrchestratorService {
         return mealPlanRepository.save(plan);
     }
 
-    // ---------- agent calls ----------
+    // ---------- LLM calls ----------
 
     private JsonNode callChef(String profileJson, String userRequest, String regenerationFeedback) {
         StringBuilder userMsg = new StringBuilder();
@@ -161,9 +165,8 @@ public class MealOrchestratorService {
         return parseJsonOrThrow(raw, "optimizer");
     }
 
-    // ---------- helpers ----------
+    // ---------- response building ----------
 
-    /** Build the combined response payload the controller returns to the frontend. */
     public String buildFrontendPayload(MealPlan plan) {
         ObjectNode combined = mapper.createObjectNode();
         combined.put("status", plan.getStatus().name());
@@ -189,33 +192,68 @@ public class MealOrchestratorService {
         return applied;
     }
 
-    private ObjectNode buildReviewPayload(ObjectNode llmReview, List<Finding> deterministicFindings) {
+    private ObjectNode buildReviewPayload(ObjectNode llmReview,
+                                          List<DrugNutrientRuleEngine.Finding> drugFindings,
+                                          List<ConditionFoodRuleEngine.Finding> conditionFindings,
+                                          List<String> uncoveredMeds,
+                                          List<String> uncoveredConditions) {
         ObjectNode out = llmReview == null ? mapper.createObjectNode() : llmReview.deepCopy();
-        ArrayNode detArr = mapper.createArrayNode();
-        for (Finding f : deterministicFindings) {
+
+        ArrayNode drugArr = mapper.createArrayNode();
+        for (DrugNutrientRuleEngine.Finding f : drugFindings) {
             ObjectNode n = mapper.createObjectNode();
             n.put("medication", f.medication());
             n.put("ingredient", f.ingredient());
             n.put("severity", f.severity().name());
             n.put("reason", f.reason());
             n.put("source", f.source());
-            detArr.add(n);
+            drugArr.add(n);
         }
-        out.set("deterministicFindings", detArr);
+        out.set("deterministicFindings", drugArr);
+
+        ArrayNode condArr = mapper.createArrayNode();
+        for (ConditionFoodRuleEngine.Finding f : conditionFindings) {
+            ObjectNode n = mapper.createObjectNode();
+            n.put("condition", f.condition());
+            n.put("ingredient", f.ingredient());
+            n.put("severity", f.severity().name());
+            n.put("reason", f.reason());
+            n.put("source", f.source());
+            condArr.add(n);
+        }
+        out.set("conditionFindings", condArr);
+
+        ObjectNode coverage = mapper.createObjectNode();
+        ArrayNode medsArr = mapper.createArrayNode();
+        for (String m : uncoveredMeds) medsArr.add(m);
+        coverage.set("uncoveredMedications", medsArr);
+        ArrayNode condsArr = mapper.createArrayNode();
+        for (String c : uncoveredConditions) condsArr.add(c);
+        coverage.set("uncoveredConditions", condsArr);
+        out.set("coverage", coverage);
+
         return out;
     }
 
-    private String buildFeedbackFromFindings(List<Finding> findings) {
-        StringBuilder sb = new StringBuilder(
-            "The previous recipe contained ingredients that interact with the user's medications. Remove or replace these:\n");
-        for (Finding f : findings) {
+    private String buildFeedback(List<DrugNutrientRuleEngine.Finding> drugFindings,
+                                 List<ConditionFoodRuleEngine.Finding> conditionFindings) {
+        StringBuilder sb = new StringBuilder("The previous recipe failed deterministic safety checks. Remove or replace these:\n");
+        for (DrugNutrientRuleEngine.Finding f : drugFindings) {
             if (f.severity() == Severity.BLOCK) {
-                sb.append("- '").append(f.ingredient()).append("' interacts with ")
+                sb.append("- '").append(f.ingredient()).append("' interacts with medication ")
                   .append(f.medication()).append(": ").append(f.reason()).append("\n");
+            }
+        }
+        for (ConditionFoodRuleEngine.Finding f : conditionFindings) {
+            if (f.severity() == ConditionFoodRuleEngine.Severity.BLOCK) {
+                sb.append("- '").append(f.ingredient()).append("' is contraindicated for ")
+                  .append(f.condition()).append(": ").append(f.reason()).append("\n");
             }
         }
         return sb.toString();
     }
+
+    // ---------- extraction helpers ----------
 
     private List<String> extractIngredientNames(JsonNode recipe) {
         List<String> out = new ArrayList<>();
@@ -224,12 +262,44 @@ public class MealOrchestratorService {
         return out;
     }
 
-    private List<String> extractMedications(User user) {
+    private List<String> extractMedicationGenericNames(User user) {
         if (user.getMedications() == null) return List.of();
         List<String> out = new ArrayList<>();
         for (Medication m : user.getMedications()) {
             if (Boolean.TRUE.equals(m.getActive()) && m.getGenericName() != null) {
                 out.add(m.getGenericName().toLowerCase().trim());
+            }
+        }
+        return out;
+    }
+
+    private List<String> extractConditions(User user) {
+        if (user.getHealthConditions() == null) return List.of();
+        List<String> out = new ArrayList<>();
+        for (HealthCondition c : user.getHealthConditions()) {
+            if (c.getCondition() != null) out.add(c.getCondition());
+        }
+        return out;
+    }
+
+    private List<String> extractUncoveredMedications(User user) {
+        if (user.getMedications() == null) return List.of();
+        List<String> out = new ArrayList<>();
+        for (Medication m : user.getMedications()) {
+            if (!Boolean.TRUE.equals(m.getActive())) continue;
+            if (!drugEngine.hasCoverage(m.getGenericName())) {
+                out.add(m.getDisplayName());
+            }
+        }
+        return out;
+    }
+
+    private List<String> extractUncoveredConditions(User user) {
+        if (user.getHealthConditions() == null) return List.of();
+        List<String> out = new ArrayList<>();
+        for (HealthCondition c : user.getHealthConditions()) {
+            if (!conditionEngine.hasCoverage(c.getCondition())) {
+                out.add(c.getCondition());
             }
         }
         return out;
@@ -259,7 +329,6 @@ public class MealOrchestratorService {
         }
         profile.set("medications", meds);
 
-        // Eating window context
         LocalTime startT = user.getEatingWindowStart();
         LocalTime endT   = user.getEatingWindowEnd();
         if (startT != null && endT != null) {
@@ -292,9 +361,8 @@ public class MealOrchestratorService {
     private String nonNull(String s) { return s == null ? "" : s; }
 
     private JsonNode parseJsonOrThrow(String raw, String agent) {
-        try {
-            return mapper.readTree(cleanJsonResponse(raw));
-        } catch (Exception e) {
+        try { return mapper.readTree(cleanJsonResponse(raw)); }
+        catch (Exception e) {
             log.error("Failed to parse {} response: {}", agent, raw, e);
             throw new RuntimeException("Could not parse " + agent + " response as JSON", e);
         }
@@ -304,7 +372,6 @@ public class MealOrchestratorService {
         try { return mapper.readTree(s); } catch (Exception e) { return mapper.createObjectNode(); }
     }
 
-    /** Strip prose around JSON if the model ignored response_format. */
     private String cleanJsonResponse(String raw) {
         if (raw == null) return "{}";
         int start = raw.indexOf('{');
